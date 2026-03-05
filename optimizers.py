@@ -15,7 +15,7 @@ from botorch.generation.gen import gen_candidates_scipy, TGenCandidates, gen_can
 from abc import abstractmethod
 
 from botorch.utils.sampling import draw_sobol_samples
-
+from mcmc_algorithms import eula_best, mala_best
 def _bounds_to_tensor(bounds, dtype=torch.float64):
     '''
     Convert list of tuples bounds to (2, dim) tensor
