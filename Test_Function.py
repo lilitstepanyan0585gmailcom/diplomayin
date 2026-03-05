@@ -421,3 +421,52 @@ class Rosenbrock(SyntheticTestFunction):
         if self.negate_:
             f_X *= -1
         return f_X
+class Rastrigin(SyntheticTestFunction):
+    _check_grad_at_opt = False
+
+    def __init__(self, dim=2, noise_std=None, negate=False, bounds=None):
+        self.dim = dim
+        self.contexts_dim = 0
+        self._bounds = [(0.0, 1.0) for _ in range(self.dim)]
+
+        self.continuous_inds = list(range(self.dim))
+        self.discrete_inds = []
+        self.categorical_inds = []
+
+        super().__init__(noise_std=noise_std, negate=False, bounds=bounds)
+        self.negate_ = negate
+
+    def _evaluate_true(self, X):
+        Xs = -5.12 + X * 10.24
+        f_X = 10.0 * self.dim + (Xs**2 - 10.0 * torch.cos(2.0 * math.pi * Xs)).sum(dim=-1)
+        if self.negate_:
+            f_X *= -1
+        return f_X.view(-1, 1)
+
+
+class HolderTable(SyntheticTestFunction):
+    _check_grad_at_opt = False
+
+    def __init__(self, noise_std=None, negate=False, bounds=None):
+        self.dim = 2
+        self.contexts_dim = 0
+        self._bounds = [(0.0, 1.0) for _ in range(self.dim)]
+
+        self.continuous_inds = list(range(self.dim))
+        self.discrete_inds = []
+        self.categorical_inds = []
+
+        super().__init__(noise_std=noise_std, negate=False, bounds=bounds)
+        self.negate_ = negate
+
+    def _evaluate_true(self, X):
+        Xs = -10.0 + X * 20.0
+        x = Xs[..., 0]
+        y = Xs[..., 1]
+
+        inner = torch.abs(1.0 - torch.sqrt(x**2 + y**2) / math.pi)
+        f_X = -torch.abs(torch.sin(x) * torch.cos(y) * torch.exp(inner))
+
+        if self.negate_:
+            f_X *= -1
+        return f_X.view(-1, 1)
