@@ -209,3 +209,80 @@ class HMC_sampling(BOTorchOptimizer):
             candidates = self.sample()
             self.evaluate_new_candidates(candidates.detach(), i)
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
+class Langevin_sampling(BOTorchOptimizer):
+    def __init__(
+        self,
+        problem,
+        init_size=10,
+        running_rounds=200,
+        device=torch.device("cpu"),
+        beta=1.5,
+        method="mala",          # "eula" or "mala"
+        temperature=0.5,
+        step=0.2,
+        n_steps=3000,
+        burn=300,
+        thin=5,
+        n_chains=16,
+        use_reflect=True,
+        seed=42,
+    ):
+        super().__init__(problem, init_size, running_rounds, device=device, beta=beta)
+        self.method = method
+        self.temperature = temperature
+        self.step = step
+        self.n_steps = n_steps
+        self.burn = burn
+        self.thin = thin
+        self.n_chains = n_chains
+        self.use_reflect = use_reflect
+        self.seed = seed
+        self.acqf = None
+
+    def sample(self):
+        if self.acqf is None:
+            raise RuntimeError("acqf is not set")
+
+        if self.method == "eula":
+            res = eula_best(
+                acqf=self.acqf,
+                bounds=self.bounds,
+                n_steps=self.n_steps,
+                burn=self.burn,
+                thin=self.thin,
+                step=self.step,
+                temperature=self.temperature,
+                n_chains=self.n_chains,
+                use_reflect=self.use_reflect,
+                seed=self.seed,
+            )
+            return res.best_x
+
+        if self.method == "mala":
+            res = mala_best(
+                acqf=self.acqf,
+                bounds=self.bounds,
+                n_steps=self.n_steps,
+                burn=self.burn,
+                thin=self.thin,
+                step=self.step,
+                temperature=self.temperature,
+                n_chains=self.n_chains,
+                use_reflect=self.use_reflect,
+                seed=self.seed,
+                adapt_step=True,
+            )
+            # print("MALA accept:", res.extra["accept_rate"], "step:", res.extra["final_step"])
+            return res.best_x
+
+        raise ValueError(f"Unknown method: {self.method}")
+
+    def run_opt(self):
+        for i in tqdm(range(self.init_size, self.running_rounds)):
+            model = self.get_model()
+            ucb = UpperConfidenceBound(model=model, beta=self.beta)
+            self.acqf = ucb
+            candidates = self.sample()
+            self.evaluate_new_candidates(candidates.detach(), i)
+
+        return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
