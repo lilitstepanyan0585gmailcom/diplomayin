@@ -209,7 +209,11 @@ class HMC_sampling(BOTorchOptimizer):
             candidates = self.sample()
             self.evaluate_new_candidates(candidates.detach(), i)
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
-class Langevin_sampling(BOTorchOptimizer):
+import torch
+from tqdm import tqdm
+from botorch.acquisition import UpperConfidenceBound
+
+class MALA_sampling(BOTorchOptimizer):
     def __init__(
         self,
         problem,
@@ -217,71 +221,156 @@ class Langevin_sampling(BOTorchOptimizer):
         running_rounds=200,
         device=torch.device("cpu"),
         beta=1.5,
-        method="mala",          # "eula" or "mala"
-        temperature=0.5,
-        step=0.2,
-        n_steps=3000,
-        burn=300,
-        thin=5,
-        n_chains=16,
-        use_reflect=True,
-        seed=42,
+        step_size=None,
+        n_burn_in_steps=None,
+        n_iterations_steps=None,
+        temp=1.0,
     ):
         super().__init__(problem, init_size, running_rounds, device=device, beta=beta)
-        self.method = method
-        self.temperature = temperature
-        self.step = step
-        self.n_steps = n_steps
-        self.burn = burn
-        self.thin = thin
-        self.n_chains = n_chains
-        self.use_reflect = use_reflect
-        self.seed = seed
-        self.acqf = None
+        self.step_size = 0.10 if step_size is None else float(step_size)
+        self.n_burn_in_steps = 200 if n_burn_in_steps is None else int(n_burn_in_steps)
+        self.n_iterations_steps = 400 if n_iterations_steps is None else int(n_iterations_steps)
+        self.temp = float(temp)
 
-    def sample(self):
-        if self.acqf is None:
-            raise RuntimeError("acqf is not set")
+        self.acqf = None  
 
-        if self.method == "eula":
-            res = eula_best(
-                acqf=self.acqf,
-                bounds=self.bounds,
-                n_steps=self.n_steps,
-                burn=self.burn,
-                thin=self.thin,
-                step=self.step,
-                temperature=self.temperature,
-                n_chains=self.n_chains,
-                use_reflect=self.use_reflect,
-                seed=self.seed,
-            )
-            return res.best_x
+    def _log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x_in = x.view(1, 1, -1)
+        return (self.acqf(x_in).sum() / self.temp)
 
-        if self.method == "mala":
-            res = mala_best(
-                acqf=self.acqf,
-                bounds=self.bounds,
-                n_steps=self.n_steps,
-                burn=self.burn,
-                thin=self.thin,
-                step=self.step,
-                temperature=self.temperature,
-                n_chains=self.n_chains,
-                use_reflect=self.use_reflect,
-                seed=self.seed,
-                adapt_step=True,
-            )
-            # print("MALA accept:", res.extra["accept_rate"], "step:", res.extra["final_step"])
-            return res.best_x
+    def _grad_log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.detach().clone().requires_grad_(True)
+        lp = self._log_pi(x)
+        (g,) = torch.autograd.grad(lp, x, create_graph=False)
+        return g.detach()
 
-        raise ValueError(f"Unknown method: {self.method}")
+    @staticmethod
+    def _log_q(x_to: torch.Tensor, x_from: torch.Tensor, mean: torch.Tensor, step_size: float) -> torch.Tensor:
+        diff = (x_to - mean)
+        return -0.5 * (diff.pow(2).sum() / (step_size ** 2))
+
+    def _propose(self, x: torch.Tensor) -> torch.Tensor:
+        g = self._grad_log_pi(x)
+        ss = self.step_size
+        mean = x + 0.5 * (ss ** 2) * g
+        x_new = mean + ss * torch.randn_like(x)
+        return x_new
+
+    def _mala_step(self, x_old: torch.Tensor):
+        ss = self.step_size
+        g_old = self._grad_log_pi(x_old)
+        mean_fwd = x_old + 0.5 * (ss ** 2) * g_old
+        x_prop = mean_fwd + ss * torch.randn_like(x_old)
+        x_prop = torch.clamp(x_prop, self.bounds[0], self.bounds[1])
+        g_prop = self._grad_log_pi(x_prop)
+        mean_rev = x_prop + 0.5 * (ss ** 2) * g_prop
+
+        log_pi_old = self._log_pi(x_old)
+        log_pi_prop = self._log_pi(x_prop)
+
+        log_q_fwd = self._log_q(x_to=x_prop, x_from=x_old, mean=mean_fwd, step_size=ss)
+        log_q_rev = self._log_q(x_to=x_old, x_from=x_prop, mean=mean_rev, step_size=ss)
+
+        log_alpha = (log_pi_prop + log_q_rev) - (log_pi_old + log_q_fwd)
+        if torch.log(torch.rand(1, device=x_old.device)) < torch.minimum(log_alpha, torch.zeros_like(log_alpha)):
+            return True, x_prop
+        return False, x_old
+
+    def sample(self) -> torch.Tensor:
+        dim = self.bounds.shape[1]
+        x = self.bounds[0] + (self.bounds[1] - self.bounds[0]) * torch.rand(dim, device=self.bounds.device)
+
+        for _ in range(self.n_burn_in_steps):
+            _, x = self._mala_step(x)
+        chain = []
+        for _ in range(self.n_iterations_steps):
+            _, x = self._mala_step(x)
+            chain.append(x.clone())
+
+        chain = torch.stack(chain)  
+        with torch.no_grad():
+            acq_vals = self.acqf(chain.unsqueeze(1))  
+        best_idx = torch.argmax(acq_vals).item()
+        best_x = chain[best_idx].view(1, -1)
+        best_x = torch.clamp(best_x, self.bounds[0], self.bounds[1])
+        return best_x
 
     def run_opt(self):
         for i in tqdm(range(self.init_size, self.running_rounds)):
             model = self.get_model()
             ucb = UpperConfidenceBound(model=model, beta=self.beta)
             self.acqf = ucb
+
+            candidates = self.sample()
+            self.evaluate_new_candidates(candidates.detach(), i)
+
+        return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
+
+class ULA_sampling(BOTorchOptimizer):
+    def __init__(
+        self,
+        problem,
+        init_size=10,
+        running_rounds=200,
+        device=torch.device("cpu"),
+        beta=1.5,
+        step_size=None,
+        n_burn_in_steps=None,
+        n_iterations_steps=None,
+        temp=1.0,
+    ):
+        super().__init__(problem, init_size, running_rounds, device=device, beta=beta)
+        self.step_size = 0.01 if step_size is None else float(step_size)
+        self.n_burn_in_steps = 200 if n_burn_in_steps is None else int(n_burn_in_steps)
+        self.n_iterations_steps = 400 if n_iterations_steps is None else int(n_iterations_steps)
+        self.temp = float(temp)
+
+        self.acqf = None
+
+    def _log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x_in = x.view(1, 1, -1)
+        return (self.acqf(x_in).sum() / self.temp)
+
+    def _grad_log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.detach().clone().requires_grad_(True)
+        lp = self._log_pi(x)
+        (g,) = torch.autograd.grad(lp, x, create_graph=False)
+        return g.detach()
+
+    def _ula_step(self, x: torch.Tensor) -> torch.Tensor:
+        eps = self.step_size
+        g = self._grad_log_pi(x)
+        noise = torch.randn_like(x)
+        x_new = x + eps * g + torch.sqrt(torch.tensor(2.0 * eps, device=x.device, dtype=x.dtype)) * noise
+        x_new = torch.clamp(x_new, self.bounds[0], self.bounds[1])
+        return x_new
+
+    def sample(self) -> torch.Tensor:
+        dim = self.bounds.shape[1]
+        x = self.bounds[0] + (self.bounds[1] - self.bounds[0]) * torch.rand(dim, device=self.bounds.device)
+
+        for _ in range(self.n_burn_in_steps):
+            x = self._ula_step(x)
+
+        chain = []
+        for _ in range(self.n_iterations_steps):
+            x = self._ula_step(x)
+            chain.append(x.clone())
+
+        chain = torch.stack(chain)
+        with torch.no_grad():
+            acq_vals = self.acqf(chain.unsqueeze(1))
+        best_idx = torch.argmax(acq_vals).item()
+        best_x = chain[best_idx].view(1, -1)
+        best_x = torch.clamp(best_x, self.bounds[0], self.bounds[1])
+        return best_x
+
+    def run_opt(self):
+        for i in tqdm(range(self.init_size, self.running_rounds)):
+            model = self.get_model()
+            ucb = UpperConfidenceBound(model=model, beta=self.beta)
+            self.acqf = ucb
+
             candidates = self.sample()
             self.evaluate_new_candidates(candidates.detach(), i)
 
