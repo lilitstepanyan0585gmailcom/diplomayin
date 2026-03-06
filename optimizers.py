@@ -209,8 +209,7 @@ class HMC_sampling(BOTorchOptimizer):
             candidates = self.sample()
             self.evaluate_new_candidates(candidates.detach(), i)
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
-
-class MALA_sampling(BOTorchOptimizer):
+ class MALA_sampling(BOTorchOptimizer):
     def __init__(
         self,
         problem,
@@ -233,7 +232,8 @@ class MALA_sampling(BOTorchOptimizer):
         self.n_burn_in_steps = int(n_burn_in_steps)
         self.n_iterations_steps = int(n_iterations_steps)
         self.temp = float(temp)
-
+        self.min_step_size = 0.005
+        self.max_step_size = 0.08
         self.n_restarts = int(n_restarts)
         self.init_noise = float(init_noise)
         self.target_acceptance = float(target_acceptance)
@@ -483,3 +483,4 @@ class ULA_sampling(BOTorchOptimizer):
             self.evaluate_new_candidates(candidates.detach(), i)
 
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
+
