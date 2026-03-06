@@ -484,3 +484,129 @@ class ULA_sampling(BOTorchOptimizer):
 
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
 
+class ULA_sampling(BOTorchOptimizer):
+    def __init__(
+        self,
+        problem,
+        init_size=10,
+        running_rounds=200,
+        device=torch.device("cpu"),
+        beta=1.5,
+        step_size=0.005,
+        n_burn_in_steps=100,
+        n_iterations_steps=200,
+        temp=1.0,
+        n_restarts=6,
+        init_noise=0.03,
+        global_restart_prob=0.3,
+    ):
+        super().__init__(problem, init_size, running_rounds, device=device, beta=beta)
+
+        self.step_size = float(step_size)
+        self.n_burn_in_steps = int(n_burn_in_steps)
+        self.n_iterations_steps = int(n_iterations_steps)
+        self.temp = float(temp)
+
+        self.n_restarts = int(n_restarts)
+        self.init_noise = float(init_noise)
+        self.global_restart_prob = float(global_restart_prob)
+
+        self.acqf = None
+        self.last_chain = None
+        self.last_acq_vals = None
+
+    def _log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x_in = x.view(1, 1, -1)
+        return self.acqf(x_in).sum() / self.temp
+
+    def _grad_log_pi(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.detach().clone().requires_grad_(True)
+        lp = self._log_pi(x)
+        (g,) = torch.autograd.grad(lp, x, create_graph=False)
+        return g.detach()
+
+    def _ula_step(self, x: torch.Tensor, step_size: float) -> torch.Tensor:
+        eps = step_size
+        g = self._grad_log_pi(x)
+        noise = torch.randn_like(x)
+
+        x_new = x + eps * g + torch.sqrt(
+            torch.tensor(2.0 * eps, device=x.device, dtype=x.dtype)
+        ) * noise
+
+        x_new = torch.clamp(x_new, self.bounds[0], self.bounds[1])
+        return x_new
+
+    def _init_from_best(self) -> torch.Tensor:
+        best_idx = torch.argmax(self.train_Y.view(-1)).item()
+        x_best = self.train_X[best_idx].detach().clone().to(self.bounds.device)
+
+        x0 = x_best + self.init_noise * torch.randn_like(x_best)
+        x0 = torch.clamp(x0, self.bounds[0], self.bounds[1])
+        return x0
+
+    def _init_random(self) -> torch.Tensor:
+        dim = self.bounds.shape[1]
+        x0 = self.bounds[0] + (self.bounds[1] - self.bounds[0]) * torch.rand(
+            dim, device=self.bounds.device, dtype=self.bounds.dtype
+        )
+        return x0
+
+    def _run_single_chain(self, x0: torch.Tensor):
+        x = x0.clone()
+        step_size = self.step_size
+
+        for _ in range(self.n_burn_in_steps):
+            x = self._ula_step(x, step_size)
+
+        chain = []
+        for _ in range(self.n_iterations_steps):
+            x = self._ula_step(x, step_size)
+            chain.append(x.clone())
+
+        chain = torch.stack(chain)
+
+        with torch.no_grad():
+            acq_vals = self.acqf(chain.unsqueeze(1)).view(-1)
+
+        best_idx = torch.argmax(acq_vals).item()
+        best_x = chain[best_idx].view(1, -1)
+        best_val = acq_vals[best_idx].item()
+
+        return best_x, best_val, chain, acq_vals
+
+    def sample(self) -> torch.Tensor:
+        best_x_global = None
+        best_val_global = -float("inf")
+        best_chain = None
+        best_acq_vals = None
+
+        for _ in range(self.n_restarts):
+            if torch.rand(1).item() < self.global_restart_prob:
+                x0 = self._init_random()
+            else:
+                x0 = self._init_from_best()
+
+            best_x, best_val, chain, acq_vals = self._run_single_chain(x0)
+
+            if best_val > best_val_global:
+                best_val_global = best_val
+                best_x_global = best_x
+                best_chain = chain
+                best_acq_vals = acq_vals
+
+        self.last_chain = best_chain.detach().clone()
+        self.last_acq_vals = best_acq_vals.detach().clone()
+
+        best_x_global = torch.clamp(best_x_global, self.bounds[0], self.bounds[1])
+        return best_x_global
+
+    def run_opt(self):
+        for i in tqdm(range(self.init_size, self.running_rounds)):
+            model = self.get_model()
+            self.acqf = UpperConfidenceBound(model=model, beta=self.beta)
+
+            candidates = self.sample()
+            self.evaluate_new_candidates(candidates.detach(), i)
+
+        return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
