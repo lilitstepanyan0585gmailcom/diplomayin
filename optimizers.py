@@ -209,7 +209,7 @@ class HMC_sampling(BOTorchOptimizer):
             candidates = self.sample()
             self.evaluate_new_candidates(candidates.detach(), i)
         return self.train_X, self.train_Y, self.cumulative_regret, self.best_Y
- class MALA_sampling(BOTorchOptimizer):
+class MALA_sampling(BOTorchOptimizer):
     def __init__(
         self,
         problem,
